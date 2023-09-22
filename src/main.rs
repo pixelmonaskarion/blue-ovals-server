@@ -181,12 +181,11 @@ async fn websocket(uuid: String, wb: Ws, server_arc: Arc<Mutex<Server>>) -> Resu
                     let mut hasher = DefaultHasher::new();
                     password.hash(&mut hasher);
                     let password_hash = hasher.finish();
+                    println!("{} {} {}", accounts.contains_key(&email), accounts.get(&email).unwrap_or(&0) == &password_hash, ids.get(&uuid).unwrap_or(&IDSInfo { account: "".into(), uuid: "".into(), public_key: "".into() }).account == email);
                     if accounts.contains_key(&email) && accounts.get(&email).unwrap_or(&0) == &password_hash && ids.get(&uuid).unwrap_or(&IDSInfo { account: "".into(), uuid: "".into(), public_key: "".into() }).account == email {
                         println!("auth succeded");
-                        let server = server_arc.lock().await;
-                        let mut message_queue = server.message_queue.lock().await;
                         let default = Vec::new();
-                        let my_message_queue = message_queue.get(&uuid).unwrap_or(&default);
+                        let my_message_queue = server_arc.lock().await.message_queue.lock().await.get(&uuid).unwrap_or(&default).clone();
                         let mut failed = false;
                         for message in my_message_queue {
                             match websocket.start_send_unpin(ws::Message::text(message)) {
@@ -195,7 +194,7 @@ async fn websocket(uuid: String, wb: Ws, server_arc: Arc<Mutex<Server>>) -> Resu
                             };
                         }
                         if !failed {
-                            message_queue.remove(&uuid);
+                            server_arc.lock().await.message_queue.lock().await.remove(&uuid);
                             let mut interval = time::interval(Duration::from_secs_f32(0.5));
                             let mut seconds = 31.0;
                             loop {
@@ -210,7 +209,7 @@ async fn websocket(uuid: String, wb: Ws, server_arc: Arc<Mutex<Server>>) -> Resu
                                 let message = receiver.try_recv();
                                 if message.is_ok() {
                                     match websocket.start_send_unpin(ws::Message::text(format!("{}", message.as_ref().unwrap()))) {
-                                        Ok(_) => {},
+                                        Ok(_) => {println!("sent message to device")},
                                         Err(e) => {println!("failed to send message{e}"); break;}
                                     };
                                 }
@@ -229,7 +228,6 @@ async fn websocket(uuid: String, wb: Ws, server_arc: Arc<Mutex<Server>>) -> Resu
         } else {
             eprintln!("no password sent!");
         }
-        println!("auth failed!");
     }));
 }
 
