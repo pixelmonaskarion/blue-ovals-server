@@ -100,7 +100,7 @@ pub async fn main() {
         let queue_file = create_or_open_file("queue.json");
         if queue_json.is_ok() && queue_file.is_ok() {
             queue_file.unwrap().write_all(queue_json.as_ref().unwrap().as_bytes()).expect("eek!");
-            println!("saved ids successfully")
+            println!("saved queue successfully");
         } else {
             if queue_json.is_err() {
                 println!("{}", queue_json.unwrap_err());
@@ -218,15 +218,19 @@ async fn websocket(uuid: String, wb: Ws, server_arc: Arc<Mutex<Server>>) -> Resu
                         }
                     } else {
                         eprintln!("password hash did not match!");
+                        let _ = websocket.start_send_unpin(ws::Message::text("password hash did not match!"));
                     }
                 } else {
                     eprintln!("password is not a string!");
+                    let _ = websocket.start_send_unpin(ws::Message::text("password is not a string!"));
                 }
             } else {
                 eprintln!("password is err!");
+                let _ = websocket.start_send_unpin(ws::Message::text("password is err!"));
             }
         } else {
             eprintln!("no password sent!");
+            let _ = websocket.start_send_unpin(ws::Message::text("no password sent!"));
         }
     }));
 }
@@ -278,6 +282,12 @@ struct Message {
     data: String,
 }
 
+#[derive(Serialize)]
+struct ServerMessage {
+    data: String,
+    sender: String,
+}
+
 async fn post_message(message: Message, server_arc: Arc<Mutex<Server>>) -> Result<impl Reply, Rejection> {
     let server = server_arc.lock().await;
     let accounts = server.accounts.lock().await;
@@ -288,7 +298,7 @@ async fn post_message(message: Message, server_arc: Arc<Mutex<Server>>) -> Resul
         if server.ids.lock().await.contains_key(&message.recipient) {
             let mut sent = false;
             if server.event_stream_senders.lock().await.contains_key(&message.recipient) {
-                match server.event_stream_senders.lock().await.get_mut(&message.recipient).unwrap().send(message.data.clone()).await {
+                match server.event_stream_senders.lock().await.get_mut(&message.recipient).unwrap().send(serde_json::to_string(&ServerMessage {data: message.data.clone(), sender: message.account.email}).unwrap()).await {
                     Ok(_) => {sent = true; println!("sent to socket successfully")},
                     Err(_) => {}
                 }
