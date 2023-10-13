@@ -1,12 +1,17 @@
-use std::{sync::Arc, collections::{HashMap, hash_map::DefaultHasher}, fs::{OpenOptions, File}, path::Path, io::Write, process::exit, convert::Infallible, net::SocketAddr, hash::{Hash, Hasher}, time::Duration};
+use std::{sync::Arc, collections::{HashMap, hash_map::DefaultHasher}, fs::{OpenOptions, File, self}, path::Path, io::Write, process::exit, convert::Infallible, net::SocketAddr, hash::{Hash, Hasher}, time::Duration};
 
 use futures::{executor::block_on, StreamExt, SinkExt};
+use prost::{bytes::Bytes, Message};
 use serde::{Deserialize, de::DeserializeOwned, Serialize};
 use tokio::{sync::{mpsc::{self, channel}, Mutex}, time};
-use warp::{Filter, filters::ws::{Ws, WebSocket, self}, reply::Reply, reject::Rejection};
+use warp::{Filter, filters::{ws::{Ws, WebSocket, self}, cors::Cors}, reply::Reply, reject::Rejection};
+
+pub mod server {
+    include!(concat!(env!("OUT_DIR"), "/server.rs"));
+}
 
 struct Server {
-    event_stream_senders: Mutex<HashMap<String, mpsc::Sender<String>>>,
+    event_stream_senders: Mutex<HashMap<String, mpsc::Sender<server::ServerMessage>>>,
     ids: Mutex<HashMap<String, IDSInfo>>,
     message_queue: Mutex<HashMap<String, Vec<String>>>,
     accounts: Mutex<HashMap<String, u64>>,
@@ -49,6 +54,14 @@ fn create_or_open_file(path: &str) -> Result<std::fs::File, std::io::Error> {
         .create(!Path::new(path).exists())
         .truncate(true)
         .open(path);
+}
+
+fn cors() -> Cors {
+    return warp::cors()
+    .allow_any_origin()
+    .allow_headers(vec!["User-Agent", "Sec-Fetch-Mode", "Referer", "Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers", "Content-Type"])
+    .allow_methods(vec!["POST", "GET"])
+    .build();
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -121,25 +134,37 @@ pub async fn main() {
         // The `ws()` filter will prepare the Websocket handshake.
         .and(warp::ws())
         .and(with_server(server_arc.clone()))
-        .and_then(websocket).or(
+        .and_then(websocket)
+        .with(cors())
+        .or(
             warp::path!("register-ids")
             .and(json_body())
             .and(with_server(server_arc.clone()))
             .and_then(register_ids)
-        ).or(
+            .with(cors())
+        )
+        .with(cors())
+        .or(
             warp::path!("create-account")
             .and(json_body())
             .and(with_server(server_arc.clone()))
             .and_then(create_account)
-        ).or(
+            .with(cors())
+        )
+        .with(cors())
+        .or(
             warp::path!("query-ids" / String)
             .and(with_server(server_arc.clone()))
             .and_then(query_ids)
-        ).or(
+            .with(cors())
+        )
+        .with(cors())
+        .or(
             warp::path!("post-message")
-            .and(json_body())
+            .and(body_bytes())
             .and(with_server(server_arc.clone()))
             .and_then(post_message)
+            .with(cors())
         );
 
     let addr: SocketAddr = "0.0.0.0:40441".parse().unwrap();
@@ -161,13 +186,17 @@ fn json_body<'a, T: DeserializeOwned + Send>() -> impl Filter<Extract = (T,), Er
         .and(warp::body::json())
 }
 
+fn body_bytes<'a>() -> impl Filter<Extract = (Bytes,), Error = warp::Rejection> + Clone {
+    warp::body::bytes()
+}
+
 async fn websocket(uuid: String, wb: Ws, server_arc: Arc<Mutex<Server>>) -> Result<impl Reply, Rejection> {
     println!("STARTING WEBSOCKET!");
     let server_arc_clone = server_arc.clone();
     let server = server_arc_clone.lock().await;
     let accounts = server.accounts.lock().await.clone();
     let ids = server.ids.lock().await.clone();
-    let (sender, mut receiver) = channel::<String>(5);
+    let (sender, mut receiver) = channel::<server::ServerMessage>(5);
     let mut event_stream_senders = server.event_stream_senders.lock().await;
     event_stream_senders.insert(uuid.clone(), sender);
     return Ok(wb.on_upgrade(move |mut websocket: WebSocket| async move {
@@ -187,8 +216,14 @@ async fn websocket(uuid: String, wb: Ws, server_arc: Arc<Mutex<Server>>) -> Resu
                         let default = Vec::new();
                         let my_message_queue = server_arc.lock().await.message_queue.lock().await.get(&uuid).unwrap_or(&default).clone();
                         let mut failed = false;
-                        for message in my_message_queue {
-                            match websocket.start_send_unpin(ws::Message::text(message)) {
+                        for message_file in my_message_queue {
+                            let message_bytes = fs::read(format!("messages/{message_file}"));
+                            if message_bytes.is_err() {
+                                eprintln!("{message_bytes:?}");
+                                continue;
+                            }
+                            let _ = fs::remove_file(format!("messages/{message_file}"));
+                            match websocket.start_send_unpin(ws::Message::binary(message_bytes.unwrap())) {
                                 Ok(_) => {},
                                 Err(e) => {println!("failed to send message{e}"); failed = true; break;}
                             };
@@ -208,7 +243,7 @@ async fn websocket(uuid: String, wb: Ws, server_arc: Arc<Mutex<Server>>) -> Resu
                                 }
                                 let message = receiver.try_recv();
                                 if message.is_ok() {
-                                    match websocket.start_send_unpin(ws::Message::text(format!("{}", message.as_ref().unwrap()))) {
+                                    match websocket.start_send_unpin(ws::Message::binary(message.as_ref().unwrap().encode_to_vec())) {
                                         Ok(_) => {println!("sent message to device")},
                                         Err(e) => {println!("failed to send message{e}"); break;}
                                     };
@@ -275,30 +310,28 @@ async fn query_ids(account: String, server_arc: Arc<Mutex<Server>>) -> Result<im
     return Ok(format!("{{\"success\": true, \"ids\": {ids_json}}}"));
 }
 
-#[derive(Deserialize)]
-struct Message {
-    account: Account,
-    recipient: String,
-    data: String,
-}
-
 #[derive(Serialize)]
 struct ServerMessage {
     data: String,
     sender: String,
 }
 
-async fn post_message(message: Message, server_arc: Arc<Mutex<Server>>) -> Result<impl Reply, Rejection> {
+async fn post_message(message_bytes: Bytes, server_arc: Arc<Mutex<Server>>) -> Result<impl Reply, Rejection> {
+    let message = server::Message::decode(message_bytes);
+    if message.is_err() {
+        return Ok(error_json("data is not a valid message"));
+    }
+    let message = message.unwrap();
     let server = server_arc.lock().await;
     let accounts = server.accounts.lock().await;
     let mut hasher = DefaultHasher::new();
-    message.account.password.hash(&mut hasher);
+    message.password.hash(&mut hasher);
     let password_hash = hasher.finish();
-    if accounts.contains_key(&message.account.email) && accounts.get(&message.account.email).unwrap_or(&0) == &password_hash {
+    if accounts.contains_key(&message.email) && accounts.get(&message.email).unwrap_or(&0) == &password_hash {
         if server.ids.lock().await.contains_key(&message.recipient) {
             let mut sent = false;
             if server.event_stream_senders.lock().await.contains_key(&message.recipient) {
-                match server.event_stream_senders.lock().await.get_mut(&message.recipient).unwrap().send(serde_json::to_string(&ServerMessage {data: message.data.clone(), sender: message.account.email}).unwrap()).await {
+                match server.event_stream_senders.lock().await.get_mut(&message.recipient).unwrap().send(server::ServerMessage {data: message.data.clone(), sender: message.email.clone()}).await {
                     Ok(_) => {sent = true; println!("sent to socket successfully")},
                     Err(_) => {}
                 }
@@ -309,11 +342,23 @@ async fn post_message(message: Message, server_arc: Arc<Mutex<Server>>) -> Resul
                 if !server.message_queue.lock().await.contains_key(&message.recipient) {
                     server.message_queue.lock().await.insert(message.recipient.clone(), Vec::new());
                 }
-                server.message_queue.lock().await.get_mut(&message.recipient).unwrap().push(message.data.clone());
+                let message_file = save_message(server::ServerMessage {data: message.data.clone(), sender: message.email});
+                if message_file.is_ok() {
+                    server.message_queue.lock().await.get_mut(&message.recipient).unwrap().push(message_file.unwrap());
+                }
             }
             return Ok(format!("{{\"success\": true}}"));
         }
         return Ok(error_json("no recipient"));
     }
     return Ok(error_json("auth failed"));
+}
+
+fn save_message(message: server::ServerMessage) -> Result<String, std::io::Error> {
+    let message_bytes = message.encode_to_vec();
+    let file_name = uuid::Uuid::new_v4();
+    fs::create_dir_all("messages/")?;
+    let mut file = File::create(format!("messages/{file_name}"))?;
+    file.write_all(&message_bytes)?;
+    return Ok(file_name.to_string());
 }

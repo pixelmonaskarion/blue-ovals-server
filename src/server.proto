@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package server;
+
+message Message {
+    string email = 1;
+    string password = 2;
+    string recipient = 3;
+    bytes data = 4;
+}
+
+message ServerMessage {
+    string sender = 1;
+    bytes data = 2;
+}
